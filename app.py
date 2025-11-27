@@ -1,5 +1,6 @@
 import os
 import base64
+import json
 from datetime import datetime
 from flask import Flask, request, Response
 from flask_sqlalchemy import SQLAlchemy
@@ -15,7 +16,6 @@ app.config['SQLALCHEMY_DATABASE_URI'] = db_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# --- 데이터 모델 ---
 class MemoryLog(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.String(100), index=True)
@@ -29,7 +29,7 @@ with app.app_context():
 
 PIXEL_GIF_DATA = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
 
-# --- 1. 저장 (이미지 태그 해킹 - rplay에서도 작동함) ---
+# [1] 자동 저장 (이미지 태그 해킹)
 @app.route('/save')
 def save_log():
     u = request.args.get('u')
@@ -38,33 +38,34 @@ def save_log():
     d = request.args.get('d')
 
     if u and c and pw and d:
-        # 무조건 추가 (Insert)
+        # 중복 방지 로직 (선택 사항: 같은 내용이 최신이면 저장 안 함)
+        # last_log = MemoryLog.query.filter_by(user_id=u, char_id=c).order_by(MemoryLog.updated_at.desc()).first()
+        # if last_log and last_log.content == d: return Response(PIXEL_GIF_DATA, mimetype='image/gif')
+
         new_log = MemoryLog(user_id=u, char_id=c, password=pw, content=d)
         db.session.add(new_log)
         db.session.commit()
     
     return Response(PIXEL_GIF_DATA, mimetype='image/gif')
 
-# --- 2. 삭제 (관리자 페이지 내부 동작) ---
-@app.route('/delete_action')
-def delete_action():
+# [2] 삭제 (이미지 태그 해킹)
+@app.route('/delete')
+def delete_log():
     log_id = request.args.get('id')
     pw = request.args.get('pw')
-    u = request.args.get('u')
-    c = request.args.get('c')
 
     if log_id and pw:
         log = MemoryLog.query.get(log_id)
         if log and log.password == pw:
             db.session.delete(log)
             db.session.commit()
-    
-    # 삭제 후 다시 관리 페이지로 리다이렉트
-    return f"<script>location.href='/manager?u={u}&c={c}&pw={pw}';</script>"
 
-# --- 3. 관리자 화면 (Iframe용 HTML 반환) ---
-@app.route('/manager')
-def manager_view():
+    return Response(PIXEL_GIF_DATA, mimetype='image/gif')
+
+# [3] ★ 데이터 브릿지 (핵심)
+# 이 페이지는 Iframe으로 불려와서, 부모(상태창)에게 데이터를 던져주고 사라집니다.
+@app.route('/bridge')
+def data_bridge():
     u = request.args.get('u')
     c = request.args.get('c')
     pw = request.args.get('pw')
@@ -73,58 +74,34 @@ def manager_view():
     logs = MemoryLog.query.filter_by(user_id=u, char_id=c, password=pw)\
         .order_by(MemoryLog.updated_at.desc()).limit(50).all()
 
-    # HTML 생성
-    log_items = ""
+    # 데이터를 JSON 리스트로 변환
+    data_list = []
     for log in logs:
-        # 안전한 텍스트 처리
-        safe_content = log.content.replace('"', '&quot;')
-        date_str = log.updated_at.strftime("%Y-%m-%d %H:%M")
-        
-        log_items += f"""
-        <div class="log-item">
-            <div class="meta">{date_str}</div>
-            <div class="content">{log.content}</div>
-            <div class="actions">
-                <button class="btn-copy" onclick="copyToClip('{safe_content}')">복사</button>
-                <a href="/delete_action?id={log.id}&pw={pw}&u={u}&c={c}" class="btn-del" onclick="return confirm('삭제합니까?')">삭제</a>
-            </div>
-        </div>
-        """
+        # JS 에러 방지용 이스케이프
+        safe_content = log.content.replace('"', '\\"').replace("'", "\\'")
+        data_list.append({
+            "id": log.id,
+            "content": safe_content,
+            "date": log.updated_at.strftime("%m/%d %H:%M")
+        })
 
+    # Python 객체를 JSON 문자열로 변환
+    json_data = json.dumps(data_list)
+
+    # HTML 응답: 부모에게 postMessage를 보내는 스크립트만 포함
     html = f"""
     <!DOCTYPE html>
     <html>
-    <head>
-        <meta charset="utf-8">
-        <style>
-            body {{ background: #111; color: #eee; font-family: sans-serif; margin: 0; padding: 10px; font-size: 12px; }}
-            .log-item {{ background: #222; border: 1px solid #444; border-radius: 4px; padding: 8px; margin-bottom: 6px; }}
-            .meta {{ color: #888; font-size: 0.8em; margin-bottom: 4px; }}
-            .content {{ color: #fff; margin-bottom: 6px; word-break: break-all; }}
-            .actions {{ display: flex; gap: 5px; justify-content: flex-end; }}
-            button, a {{ text-decoration: none; padding: 4px 8px; border-radius: 3px; font-size: 11px; cursor: pointer; border: none; }}
-            .btn-copy {{ background: #4caf50; color: white; }}
-            .btn-del {{ background: #f44336; color: white; }}
-            
-            /* 스크롤바 */
-            ::-webkit-scrollbar {{ width: 5px; }}
-            ::-webkit-scrollbar-thumb {{ background: #444; border-radius: 3px; }}
-        </style>
-        <script>
-            function copyToClip(text) {{
-                navigator.clipboard.writeText(text).then(() => {{
-                    alert("📋 클립보드에 복사되었습니다!\\n상태창의 '기억 주입' 칸에 붙여넣으세요.");
-                }}).catch(err => {{
-                    prompt("복사해서 사용하세요:", text);
-                }});
-            }}
-        </script>
-    </head>
     <body>
-        <div style="text-align:center; color:#888; margin-bottom:10px;">
-            ▼ {u}님의 {c} 기억 보관소 ▼
-        </div>
-        {log_items if logs else "<div style='text-align:center; padding:20px; color:#666;'>저장된 기록이 없습니다.</div>"}
+    <script>
+        const logs = {json_data};
+        // 부모 창(상태창)에게 메시지 전송
+        window.parent.postMessage({{
+            type: 'LOG_DATA_SYNC',
+            status: 'success',
+            logs: logs
+        }}, '*');
+    </script>
     </body>
     </html>
     """
