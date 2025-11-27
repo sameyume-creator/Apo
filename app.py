@@ -86,7 +86,7 @@ def data_bridge():
         })
 
     # Python 객체를 JSON 문자열로 변환
-    json_data = json.dumps(data_list)
+    json_data = json.dumps(data_list, ensure_ascii=False)
 
     # HTML 응답: 부모에게 postMessage를 보내는 스크립트만 포함
     html = f"""
