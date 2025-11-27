@@ -1,5 +1,6 @@
-fastapi
-uvicorn
-sqlmodel
+flask
+gunicorn
 psycopg2-binary
-python-multipart
+flask-sqlalchemy
+pillow
+requests
