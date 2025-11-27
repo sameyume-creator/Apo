@@ -1,64 +1,88 @@
 import os
 import base64
+import json
 from datetime import datetime
 from flask import Flask, request, Response, redirect, url_for
 from flask_sqlalchemy import SQLAlchemy
 
 app = Flask(__name__)
 
-# --- 1. DB 설정 (Railway PostgreSQL 대응) ---
+# --- DB 설정 ---
 db_url = os.environ.get('DATABASE_URL', 'sqlite:///local.db')
 if db_url.startswith('postgres://'):
     db_url = db_url.replace('postgres://', 'postgresql://', 1)
 
 app.config['SQLALCHEMY_DATABASE_URI'] = db_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-
 db = SQLAlchemy(app)
 
-# --- 2. 데이터 모델 ---
+# --- 모델 1: 누적 로그 (History) ---
 class MemoryLog(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.String(100), index=True)
     char_id = db.Column(db.String(100), index=True)
-    content = db.Column(db.Text)
+    content = db.Column(db.Text) # 로그 내용
     password = db.Column(db.String(50))
     updated_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-# 앱 시작 시 테이블 생성
+# --- 모델 2: 현재 상태 (Snapshot) ---
+# 50개의 변수를 매번 컬럼으로 만들지 않고, 통째로 JSON으로 저장합니다.
+class CurrentState(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.String(100), index=True)
+    char_id = db.Column(db.String(100), index=True)
+    json_data = db.Column(db.Text) # 50개 변수가 담긴 JSON 문자열
+    password = db.Column(db.String(50))
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow)
+
 with app.app_context():
     db.create_all()
 
-# 투명 픽셀 (이미지 해킹 응답용)
 PIXEL_GIF_DATA = base64.b64decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
 
-@app.route('/')
-def index():
-    return "Memory Server is Running!"
+# [보안] Iframe 허용
+@app.after_request
+def add_header(response):
+    response.headers['X-Frame-Options'] = 'ALLOWALL'
+    response.headers['Content-Security-Policy'] = "frame-ancestors *"
+    return response
 
-# [기능 1] 저장 (자동 저장용)
+# [기능 1] 통합 저장 (로그 + 상태)
 @app.route('/save')
-def save_log():
+def save_data():
     u = request.args.get('u')
     c = request.args.get('c')
     pw = request.args.get('pw')
-    d = request.args.get('d')
-
-    if u and c and pw and d:
-        # DB에 저장
-        new_log = MemoryLog(user_id=u, char_id=c, password=pw, content=d)
-        db.session.add(new_log)
-        db.session.commit()
     
+    log_text = request.args.get('d')      # 누적할 로그 (없을 수도 있음)
+    state_json = request.args.get('s')    # 50개 변수 JSON (없을 수도 있음)
+
+    if not u or not c or not pw: return Response(PIXEL_GIF_DATA, mimetype='image/gif')
+
+    # 1. 로그가 있으면 누적 저장
+    if log_text:
+        db.session.add(MemoryLog(user_id=u, char_id=c, password=pw, content=log_text))
+
+    # 2. 상태값이 있으면 덮어쓰기 (Upsert)
+    if state_json:
+        # 기존 상태 찾기
+        state_record = CurrentState.query.filter_by(user_id=u, char_id=c, password=pw).first()
+        if state_record:
+            state_record.json_data = state_json
+            state_record.updated_at = datetime.utcnow()
+        else:
+            db.session.add(CurrentState(user_id=u, char_id=c, password=pw, json_data=state_json))
+
+    db.session.commit()
     return Response(PIXEL_GIF_DATA, mimetype='image/gif')
 
-# [기능 2] 삭제 동작 (삭제 후 관리 페이지로 돌아감)
+# [기능 2] 로그 삭제
 @app.route('/delete_action')
 def delete_action():
     log_id = request.args.get('id')
     pw = request.args.get('pw')
-    u = request.args.get('u') # 리다이렉트용
-    c = request.args.get('c') # 리다이렉트용
+    u = request.args.get('u')
+    c = request.args.get('c')
 
     if log_id and pw:
         log = MemoryLog.query.get(log_id)
@@ -66,105 +90,179 @@ def delete_action():
             db.session.delete(log)
             db.session.commit()
             
-    # 삭제 후 다시 목록 화면으로 이동 (새로고침 효과)
     return redirect(url_for('manager_view', u=u, c=c, pw=pw))
 
-# [기능 3] 관리자 화면 (HTML을 만들어서 줌 - Iframe용)
+# [기능 3] ★ 대시보드 뷰 (디자인 리메이크)
 @app.route('/manager')
 def manager_view():
     u = request.args.get('u')
     c = request.args.get('c')
     pw = request.args.get('pw')
 
-    # 최신순 50개 조회
+    # 1. 로그 가져오기 (최신 30개)
     logs = MemoryLog.query.filter_by(user_id=u, char_id=c, password=pw)\
-        .order_by(MemoryLog.updated_at.desc()).limit(50).all()
+        .order_by(MemoryLog.updated_at.desc()).limit(30).all()
 
-    # HTML 조립
-    rows = ""
-    if not logs:
-        rows = "<div class='empty'>저장된 기억이 없습니다.</div>"
-    else:
-        for log in logs:
-            safe_content = log.content.replace("'", "&apos;").replace('"', '&quot;')
-            date_str = log.updated_at.strftime("%m/%d %H:%M")
-            
-            rows += f"""
-            <div class='row'>
-                <input type='checkbox' class='chk' value='{safe_content}'>
-                <div class='info'>
-                    <div class='date'>{date_str}</div>
-                    <div class='text'>{log.content}</div>
-                </div>
-                <a href='/delete_action?id={log.id}&pw={pw}&u={u}&c={c}' class='btn-del' onclick="return confirm('삭제하시겠습니까?')">삭제</a>
-            </div>
-            """
+    # 2. 상태 가져오기
+    state_record = CurrentState.query.filter_by(user_id=u, char_id=c, password=pw).first()
+    state_data = {}
+    if state_record and state_record.json_data:
+        try:
+            state_data = json.loads(state_record.json_data)
+        except:
+            state_data = {"Error": "JSON 파싱 실패"}
 
-    # 전체 HTML 페이지 반환
+    # HTML 템플릿 (CSS Grid & Glassmorphism)
     html = f"""
     <!DOCTYPE html>
-    <html>
+    <html lang="ko">
     <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Memory Dashboard</title>
         <style>
-            body {{ background: #000; color: #fff; font-family: sans-serif; margin: 0; padding: 10px; }}
-            .row {{ display: flex; gap: 10px; border-bottom: 1px solid #333; padding: 10px 0; align-items: flex-start; }}
-            .chk {{ transform: scale(1.5); margin-top: 5px; cursor: pointer; }}
-            .info {{ flex-grow: 1; overflow: hidden; }}
-            .date {{ color: #666; font-size: 12px; margin-bottom: 4px; }}
-            .text {{ color: #eee; font-size: 14px; line-height: 1.4; word-break: break-all; }}
-            .btn-del {{ 
-                background: #330000; color: #ff5555; text-decoration: none; 
-                padding: 6px 10px; border: 1px solid #550000; border-radius: 4px; 
-                font-size: 12px; white-space: nowrap; height: fit-content;
+            :root {{
+                --bg-color: #0f172a;
+                --card-bg: #1e293b;
+                --accent: #6366f1;
+                --text-main: #f1f5f9;
+                --text-sub: #94a3b8;
+                --border: #334155;
             }}
-            .empty {{ text-align: center; color: #666; padding: 20px; }}
+            body {{
+                background-color: var(--bg-color); color: var(--text-main);
+                font-family: 'Pretendard', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+                margin: 0; padding: 20px;
+                display: flex; flex-direction: column; gap: 20px;
+            }}
+            /* 그리드 레이아웃 */
+            .dashboard-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                gap: 20px;
+            }}
             
-            /* 하단 고정 바 */
-            .bottom-bar {{ 
-                position: fixed; bottom: 0; left: 0; right: 0; 
-                background: #111; padding: 10px; border-top: 1px solid #333; 
-                display: flex; gap: 10px;
+            /* 카드 스타일 */
+            .card {{
+                background: var(--card-bg);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 20px;
+                box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
             }}
-            .btn {{ flex: 1; padding: 12px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; color: white; }}
-            .btn-copy {{ background: #4f46e5; }}
-            .btn-refresh {{ background: #333; flex: 0.3; }}
+            .card-header {{
+                font-size: 1.1em; font-weight: bold; color: var(--accent);
+                margin-bottom: 15px; border-bottom: 2px solid var(--border);
+                padding-bottom: 10px; display: flex; justify-content: space-between;
+            }}
+
+            /* 상태 변수 리스트 */
+            .stat-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; font-size: 0.9em; }}
+            .stat-item {{ display: flex; justify-content: space-between; padding: 5px; border-bottom: 1px dashed var(--border); }}
+            .stat-key {{ color: var(--text-sub); }}
+            .stat-val {{ font-weight: bold; color: #fff; text-align: right; }}
+
+            /* 로그 리스트 */
+            .log-list {{ max-height: 400px; overflow-y: auto; }}
+            .log-item {{ 
+                display: flex; gap: 10px; padding: 10px; 
+                background: #0f172a; border-radius: 6px; margin-bottom: 8px; border: 1px solid var(--border);
+            }}
+            .chk {{ transform: scale(1.2); margin-top: 4px; cursor: pointer; }}
+            .log-content {{ flex: 1; font-size: 0.9em; line-height: 1.4; }}
+            .log-date {{ font-size: 0.75em; color: var(--text-sub); margin-bottom: 4px; }}
+            .btn-del {{ 
+                color: #ef4444; border: 1px solid #ef4444; background: transparent;
+                padding: 4px 8px; border-radius: 4px; cursor: pointer; font-size: 0.8em; height: fit-content; text-decoration: none;
+            }}
+            .btn-del:hover {{ background: #ef4444; color: #fff; }}
+
+            /* 하단 플로팅 바 */
+            .floating-bar {{
+                position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+                background: rgba(30, 41, 59, 0.9); backdrop-filter: blur(10px);
+                padding: 10px 20px; border-radius: 50px; border: 1px solid var(--accent);
+                display: flex; gap: 15px; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5);
+                width: max-content;
+            }}
+            .btn-float {{
+                background: var(--accent); color: white; border: none;
+                padding: 10px 20px; border-radius: 20px; font-weight: bold; cursor: pointer;
+            }}
+            .btn-float:hover {{ filter: brightness(1.1); }}
         </style>
         <script>
             function copyChecked() {{
                 const chks = document.querySelectorAll('.chk:checked');
-                if(chks.length === 0) return alert("선택된 항목이 없습니다.");
-                
-                let result = "";
-                chks.forEach(c => result += "- " + c.value + "\\n");
-                
-                // 클립보드 복사 시도
-                navigator.clipboard.writeText(result).then(() => {{
-                    alert("✅ 복사 완료!\\n아래 '붙여넣기' 칸에 넣어주세요.");
-                }}).catch(err => {{
-                    prompt("Ctrl+C를 눌러 복사하세요:", result);
-                }});
+                if(chks.length === 0) return alert("선택된 로그가 없습니다.");
+                let text = "";
+                chks.forEach(c => text += "- " + c.value + "\\n");
+                navigator.clipboard.writeText(text).then(() => alert("📋 복사 완료! 상태창에 붙여넣으세요."))
+                .catch(() => prompt("Ctrl+C로 복사하세요:", text));
             }}
         </script>
     </head>
     <body>
-        <div style="padding-bottom: 60px;"> {rows}
+        <div style="font-size:1.5em; font-weight:bold; text-align:center; margin-bottom:10px;">
+            🧬 {c} <span style="font-size:0.6em; color:#64748b;">(User: {u})</span>
         </div>
-        <div class="bottom-bar">
-            <button onclick="location.reload()" class="btn btn-refresh">🔄</button>
-            <button onclick="copyChecked()" class="btn btn-copy">📋 선택 복사</button>
+
+        <div class="dashboard-grid">
+            <div class="card">
+                <div class="card-header">👤 User Info</div>
+                <div class="stat-grid" style="grid-template-columns: 1fr;">
+                    {''.join([f'<div class="stat-item"><span class="stat-key">{k}</span><span class="stat-val">{v}</span></div>' 
+                              for k, v in state_data.get('user_info', {{}}).items()])}
+                    
+                    <div style="margin-top:10px; color:var(--accent); font-weight:bold;">⚔️ Skills</div>
+                    {''.join([f'<div class="stat-item"><span class="stat-key">Skill</span><span class="stat-val">{v}</span></div>' 
+                              for v in state_data.get('skills', [])])}
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">🌍 Reputation</div>
+                <div class="stat-grid">
+                     {''.join([f'<div class="stat-item"><span class="stat-key">{k}</span><span class="stat-val">{v}</span></div>' 
+                              for k, v in state_data.get('reputation', {{}}).items()])}
+                </div>
+            </div>
+
+            <div class="card" style="grid-column: span 2;">
+                <div class="card-header">📊 Character Status</div>
+                <div class="stat-grid" style="grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));">
+                     {''.join([f'<div class="stat-item"><span class="stat-key">{k}</span><span class="stat-val">{v}</span></div>' 
+                              for k, v in state_data.get('status', {{}}).items()])}
+                </div>
+            </div>
+
+            <div class="card" style="grid-column: span 2;">
+                <div class="card-header">
+                    📜 Memory Log ({len(logs)})
+                </div>
+                <div class="log-list">
+                    {''.join([f'''
+                    <div class="log-item">
+                        <input type="checkbox" class="chk" value="{l.content.replace('"', '&quot;')}">
+                        <div class="log-content">
+                            <div class="log-date">{l.updated_at.strftime("%m/%d %H:%M")}</div>
+                            {l.content}
+                        </div>
+                        <a href="/delete_action?id={l.id}&pw={pw}&u={u}&c={c}" class="btn-del" onclick="return confirm('삭제?')">DEL</a>
+                    </div>
+                    ''' for l in logs])}
+                </div>
+            </div>
+        </div>
+
+        <div style="height: 60px;"></div> <div class="floating-bar">
+            <button onclick="location.reload()" class="btn-float" style="background:#334155;">🔄 Refresh</button>
+            <button onclick="copyChecked()" class="btn-float">📋 Copy Selected</button>
         </div>
     </body>
     </html>
     """
     return Response(html, mimetype='text/html')
-@app.after_request
-def add_header(response):
-    # 모든 도메인에서 이 서버를 Iframe으로 띄울 수 있게 허용
-    response.headers['X-Frame-Options'] = 'ALLOWALL'
-    response.headers['Content-Security-Policy'] = "frame-ancestors *"
-    return response
-    
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
