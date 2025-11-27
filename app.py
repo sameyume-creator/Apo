@@ -159,6 +159,12 @@ def manager_view():
     </html>
     """
     return Response(html, mimetype='text/html')
-
+@app.after_request
+def add_header(response):
+    # 모든 도메인에서 이 서버를 Iframe으로 띄울 수 있게 허용
+    response.headers['X-Frame-Options'] = 'ALLOWALL'
+    response.headers['Content-Security-Policy'] = "frame-ancestors *"
+    return response
+    
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
